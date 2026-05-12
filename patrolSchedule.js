@@ -11,6 +11,9 @@ const patrolSchedules = {
 
   { id:"CV4(43호)", startDate:"2026-05-11", endDate:"2026-06-10", daysOfWeek:[0,1,2,3,4,5,6], timeRanges:[{ start:"08:00", end:"09:00" },{ start:"10:00", end:"11:00" }] },
 
+  { id:"CV5(43호)", startDate:"2026-05-12", endDate:"2026-06-11", daysOfWeek:[0,1,2,3,4,5,6], timeRanges:[{ start:"01:00", end:"02:00" },{ start:"18:00", end:"19:00" }] },
+
+
 
     
        
