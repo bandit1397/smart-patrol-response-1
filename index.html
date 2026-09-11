@@ -88,6 +88,62 @@
   }
   #routeLegend.collapsed .rl-header { margin-bottom: 0; }
   #routeLegend.collapsed .rl-body { display: none; }
+
+  /* 🎯 현재 목적지 고정 바 — 마커를 탭하지 않아도 목적지 이름을 항상 확인 */
+  #destBar {
+    display: none;
+    position: fixed;
+    top: 8px;
+    left: 10px;
+    right: 66px;          /* 우측 상단 시간 패널(⏰)과 겹치지 않게 */
+    z-index: 10001;
+    align-items: center;
+    gap: 8px;
+    background: rgba(10, 82, 255, 0.95);
+    color: #fff;
+    border-radius: 18px;
+    padding: 7px 8px 7px 12px;
+    font-size: 13px;
+    line-height: 1.3;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+  }
+  #destBar.on { display: flex; }
+  #destBar .db-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #destBar .db-sub { opacity: 0.85; font-size: 11px; }
+  #destBar .db-close {
+    flex: none;
+    background: rgba(255,255,255,0.2);
+    border: none;
+    color: #fff;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  /* wpt 팝업: 한 번 탭 = 이름 확인, 목적지 변경은 버튼으로만 */
+  .wpt-popup { font-size: 13px; line-height: 1.45; min-width: 150px; }
+  .wpt-popup .wp-name { font-weight: bold; font-size: 14px; margin-bottom: 4px; }
+  .wpt-popup .wp-meta { color: #555; margin-bottom: 6px; }
+  .wpt-popup .wp-cur { color: #0a52ff; font-weight: bold; margin-bottom: 6px; }
+  .wpt-popup button {
+    width: 100%;
+    border: none;
+    border-radius: 5px;
+    padding: 9px 10px;
+    font-size: 14px;
+    cursor: pointer;
+    color: #fff;
+  }
+  .wpt-popup .wp-go { background: #0a52ff; }
+  .wpt-popup .wp-stop { background: #6c757d; }
 </style>
 <script src="lampData.js"></script>
 <script src="patrolSchedule.js"></script>
@@ -141,6 +197,7 @@
   
 <div id="map"></div>
 <div id="routeLegend"></div>
+<div id="destBar"></div>
 
 <script>
 let activeCategories = ["안전조치"];
@@ -173,6 +230,10 @@ let entryPointLayerGroup;
 let galsanGraph = null;        // { nodes: [{lat,lon}], adj: [[{to,dist}]] } — trkpt 기반 경로망
 let galsanEntryNodeIds = [];   // 진입기준점 wpt와 대응하는 galsanGraph 노드 인덱스들
 let galsanRouteLines = [];     // 현재 표시 중인 경로 폴리라인들(외곽선 포함)
+
+// ✅ 현재 안내 중인 목적지 — 탭 한 번으로 목적지가 바뀌지 않도록 별도 상태로 고정
+let galsanDest = null;       // { name, lat, lon, marker }
+let galsanDestDist = null;   // 목적지 기준 Dijkstra 거리 배열(트랙 노드별, 팝업의 "목적지까지 약 Xm"에 사용)
 
 // 도달 가능한 모든 진입기준점의 경로를 표시 (안전 상한선만 둠)
 const GALSAN_ROUTE_MAX = 30;
@@ -315,9 +376,81 @@ function clearGalsanRoutes() {
   if (legend) { legend.style.display = "none"; legend.innerHTML = ""; }
 }
 
-// 클릭한 wpt까지, 가까운 진입기준점부터 순서대로 여러 경로를 서로 다른 색으로 표시
-function routeFromNearestEntryPoints(targetLat, targetLon) {
+// ✅ 상단 "현재 목적지" 고정 바 갱신
+//    목적지 이름이 항상 화면에 떠 있으므로, 이름 확인만을 위해 마커를 탭할 필요가 없다.
+function updateDestBar() {
+  const bar = document.getElementById("destBar");
+  if (!bar) return;
+  if (!galsanDest) {
+    bar.classList.remove("on");
+    bar.innerHTML = "";
+    return;
+  }
+  const sub = isFinite(galsanDest.nearestEntryMeters)
+    ? `<span class="db-sub">가장 가까운 진입기준점에서 약 ${Math.round(galsanDest.nearestEntryMeters)}m</span>`
+    : "";
+  bar.innerHTML =
+    `<span class="db-text">🎯 목적지: ${galsanDest.name}<br>${sub}</span>` +
+    `<button class="db-close" type="button" title="안내 해제">✕</button>`;
+  bar.classList.add("on");
+  const btn = bar.querySelector(".db-close");
+  if (btn) btn.addEventListener("click", clearGalsanDestination);
+}
+
+// ✅ 안내 해제: 경로·목적지 상태를 모두 비운다
+function clearGalsanDestination() {
   clearGalsanRoutes();
+  if (galsanDest && galsanDest.marker) restoreWptIcon(galsanDest.marker);
+  galsanDest = null;
+  galsanDestDist = null;
+  updateDestBar();
+  map.closePopup();
+}
+
+// ✅ 목적지 설정(= 경로 재계산)은 팝업의 "여기로 안내" 버튼에서만 호출된다
+function setGalsanDestination(name, lat, lon, marker) {
+  if (galsanDest && galsanDest.marker && galsanDest.marker !== marker) {
+    restoreWptIcon(galsanDest.marker);
+  }
+  galsanDest = { name, lat, lon, marker, nearestEntryMeters: NaN };
+
+  if (marker) {
+    if (!marker._defaultIcon) marker._defaultIcon = marker.options.icon;
+    marker.setIcon(L.icon({
+      iconUrl: "https://maps.google.com/mapfiles/ms/icons/orange-dot.png",
+      iconSize: [32, 32]
+    }));
+    lastClickedMarker = marker;
+  }
+
+  // 목적지를 새로 정할 때만 화면을 경로 전체에 맞춘다
+  routeFromNearestEntryPoints(lat, lon, { fit: true });
+
+  lastClickedCoord = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+  document.getElementById("clickedCoords").innerText = `📍 선택: ${lastClickedCoord}`;
+
+  updateDestBar();
+  map.closePopup();
+}
+
+function restoreWptIcon(marker) {
+  if (marker && marker._defaultIcon) marker.setIcon(marker._defaultIcon);
+}
+
+// 탭한 wpt에서 현재 목적지까지의 트랙 거리(m) — 제대로 가고 있는지 확인용
+function metersToGalsanDest(lat, lon) {
+  if (!galsanDestDist || !galsanGraph) return NaN;
+  const idx = galsanNearestNode(lat, lon);
+  if (idx === -1) return NaN;
+  const d = galsanDestDist[idx];
+  return isFinite(d) ? d : NaN;
+}
+
+// 클릭한 wpt까지, 가까운 진입기준점부터 순서대로 여러 경로를 서로 다른 색으로 표시
+function routeFromNearestEntryPoints(targetLat, targetLon, opts) {
+  const fit = !opts || opts.fit !== false;
+  clearGalsanRoutes();
+  galsanDestDist = null;
   if (!galsanGraph || galsanEntryNodeIds.length === 0) return;
 
   const targetIdx = galsanNearestNode(targetLat, targetLon);
@@ -325,6 +458,8 @@ function routeFromNearestEntryPoints(targetLat, targetLon) {
 
   // ✅ 클릭 지점에서 한 번만 Dijkstra → 모든 진입기준점까지의 트랙거리를 동시에 구함
   const { dist, prev } = galsanDijkstraFrom(targetIdx);
+  // 목적지 기준 거리표를 캐시 → 다른 wpt를 탭했을 때 "목적지까지 약 Xm"를 바로 보여준다
+  galsanDestDist = dist;
 
   // 도달 가능한 진입기준점을 트랙거리 오름차순으로 정렬(같은 노드로 스냅된 경우 1개만)
   const seen = new Set();
@@ -335,6 +470,7 @@ function routeFromNearestEntryPoints(targetLat, targetLon) {
     ranked.push({ nid, meters: dist[nid] });
   });
   ranked.sort((a, b) => a.meters - b.meters);
+  if (galsanDest && ranked.length) galsanDest.nearestEntryMeters = ranked[0].meters;
 
   const chosen = ranked.slice(0, GALSAN_ROUTE_MAX).map((entry, rank) => {
     const pathIdx = [];
@@ -387,6 +523,8 @@ function routeFromNearestEntryPoints(targetLat, targetLon) {
   }
 
   // 4) 모든 경로가 화면에 들어오도록 범위 조정(과도한 확대 방지)
+  // ⚠️ 걷는 중에 화면이 튀지 않도록, 목적지를 새로 정할 때만 범위를 맞춘다
+  if (!fit) return;
   const b = L.latLngBounds();
   chosen.forEach(r => r.latlngs.forEach(ll => b.extend(ll)));
   if (b.isValid()) map.fitBounds(b, { padding: [40, 40], maxZoom: 18 });
@@ -772,41 +910,78 @@ function initMap(){
 
             marker.bindTooltip(name, { direction: "top", offset: [0, -8] });
 
-            marker.on("click", () => {
-              const ll = marker.getLatLng();
+            if (isGalsanFile) {
+              // ✅ 갈산공원: 탭 한 번은 "이름 확인"만. 목적지 변경은 팝업의 버튼으로만 이루어진다.
+              //    (걷는 중에 이름을 확인하려고 탭했다가 경로가 초기화되던 문제 해결)
+              marker.bindPopup(() => {
+                const ll = marker.getLatLng();
+                const isDest = !!(galsanDest && galsanDest.marker === marker);
+                const toDest = isDest ? NaN : metersToGalsanDest(ll.lat, ll.lng);
 
-              // ✅ lampData 마커와 동일한 방식으로 좌표 세팅
-              lastClickedCoord = `${ll.lat.toFixed(6)},${ll.lng.toFixed(6)}`;
-              document.getElementById("clickedCoords").innerText =
-                `📍 선택: ${lastClickedCoord}`;
+                let html = `<div class="wpt-popup"><div class="wp-name">${name}</div>`;
+                if (isDest) {
+                  const m = galsanDest.nearestEntryMeters;
+                  html += `<div class="wp-cur">🎯 현재 안내 중인 목적지</div>`;
+                  if (isFinite(m)) {
+                    html += `<div class="wp-meta">가장 가까운 진입기준점에서 약 ${Math.round(m)}m</div>`;
+                  }
+                  html += `<button type="button" class="wp-stop" data-act="stop">안내 해제</button>`;
+                } else {
+                  if (isFinite(toDest)) {
+                    html += `<div class="wp-meta">현재 목적지까지 트랙 약 ${Math.round(toDest)}m</div>`;
+                  }
+                  html += `<button type="button" class="wp-go" data-act="go">🎯 여기로 안내</button>`;
+                }
+                return html + `</div>`;
+              }, { closeButton: true, autoPan: true });
 
-              // ✅ 선택된 GPX WPT 시각적 강조 (lampData와 동일 개념)
-              const selectedIcon = L.icon({
-                iconUrl: "https://maps.google.com/mapfiles/ms/icons/orange-dot.png",
-                iconSize: [32, 32]
+              marker.on("popupopen", e => {
+                marker.closeTooltip();   // 팝업과 툴팁이 겹치지 않게
+                const el = e.popup.getElement();
+                if (!el) return;
+                const btn = el.querySelector("button[data-act]");
+                if (!btn) return;
+                btn.addEventListener("click", () => {
+                  const ll = marker.getLatLng();
+                  if (btn.dataset.act === "go") {
+                    setGalsanDestination(name, ll.lat, ll.lng, marker);
+                  } else {
+                    clearGalsanDestination();
+                  }
+                });
               });
+            } else {
+              marker.on("click", () => {
+                const ll = marker.getLatLng();
 
-              // 이전에 클릭된 마커가 있으면 원래 아이콘으로 복원
-              if (lastClickedMarker && lastClickedMarker !== marker) {
-                lastClickedMarker.setIcon(
-                  lastClickedMarker._defaultIcon || blueIcon
-                );
-              }
+                // ✅ lampData 마커와 동일한 방식으로 좌표 세팅
+                lastClickedCoord = `${ll.lat.toFixed(6)},${ll.lng.toFixed(6)}`;
+                document.getElementById("clickedCoords").innerText =
+                  `📍 선택: ${lastClickedCoord}`;
 
-              // 현재 마커의 기본 아이콘 저장 (한 번만)
-              if (!marker._defaultIcon) {
-                marker._defaultIcon = marker.options.icon;
-              }
+                // ✅ 선택된 GPX WPT 시각적 강조 (lampData와 동일 개념)
+                const selectedIcon = L.icon({
+                  iconUrl: "https://maps.google.com/mapfiles/ms/icons/orange-dot.png",
+                  iconSize: [32, 32]
+                });
 
-              // 현재 마커 강조
-              marker.setIcon(selectedIcon);
-              lastClickedMarker = marker;
+                // 이전에 클릭된 마커가 있으면 원래 아이콘으로 복원
+                if (lastClickedMarker && lastClickedMarker !== marker) {
+                  lastClickedMarker.setIcon(
+                    lastClickedMarker._defaultIcon || blueIcon
+                  );
+                }
 
-              // ✅ 갈산공원 wpt면, 가까운 진입기준점들에서 트랙을 따라오는 경로를 순위별 색으로 표시
-              if (isGalsanFile) {
-                routeFromNearestEntryPoints(ll.lat, ll.lng);
-              }
-            });
+                // 현재 마커의 기본 아이콘 저장 (한 번만)
+                if (!marker._defaultIcon) {
+                  marker._defaultIcon = marker.options.icon;
+                }
+
+                // 현재 마커 강조
+                marker.setIcon(selectedIcon);
+                lastClickedMarker = marker;
+              });
+            }
 
 
             // ✅ 검색/색변화는 새 마커 인덱스로만
@@ -997,7 +1172,7 @@ function searchAndShow() {
   map.fitBounds(bounds);
 }
 
-function resetSearch(){ searchMode=false; clearMarkers(); document.getElementById("keyword").value=""; lastClickedCoord=""; document.getElementById("clickedCoords").innerText="📍"; resetGpxWptHighlight(); clearGalsanRoutes(); }
+function resetSearch(){ searchMode=false; clearMarkers(); document.getElementById("keyword").value=""; lastClickedCoord=""; document.getElementById("clickedCoords").innerText="📍"; resetGpxWptHighlight(); clearGalsanDestination(); }
 
 function navigateToPatrol() {
   if (!lastClickedCoord) {
